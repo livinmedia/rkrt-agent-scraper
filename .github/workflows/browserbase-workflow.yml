@@ -1,0 +1,43 @@
+name: Scrape Homes.com Agents (Browserbase)
+
+on:
+  schedule:
+    - cron: '0 2 1 * *'  # Monthly on the 1st at 2am UTC
+  workflow_dispatch:
+    inputs:
+      city:
+        description: 'City to scrape (leave empty for all markets)'
+        required: false
+        type: string
+      state:
+        description: 'State (e.g., TX, CA)'
+        required: false
+        type: string
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: Install dependencies
+        run: npm install
+      
+      - name: Run scraper
+        env:
+          BROWSERBASE_API_KEY: ${{ secrets.BROWSERBASE_API_KEY }}
+          BROWSERBASE_PROJECT_ID: ${{ secrets.BROWSERBASE_PROJECT_ID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          if [ -n "${{ inputs.city }}" ] && [ -n "${{ inputs.state }}" ]; then
+            node scraper.js "${{ inputs.city }}" "${{ inputs.state }}"
+          else
+            node scraper.js
+          fi
