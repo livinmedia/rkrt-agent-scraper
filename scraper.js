@@ -1,108 +1,151 @@
 /**
- * RKRT Agent Scraper
- * Scrapes real estate agents from Homes.com and saves to RKRT database.
- * Uses fetch-based scraping (no browser needed for GitHub Actions)
+ * RKRT Agent Scraper - Browserbase + Puppeteer
+ * 
+ * Uses Browserbase cloud browsers with Puppeteer to scrape Homes.com.
+ * Browserbase provides residential IPs and anti-bot evasion.
+ * 
+ * Setup:
+ *   npm install puppeteer-core
+ * 
+ * Usage:
+ *   node scraper-browserbase.js "The Woodlands" TX
+ *   node scraper-browserbase.js  # Scrapes all target markets
+ * 
+ * Environment variables:
+ *   BROWSERBASE_API_KEY - Your Browserbase API key
+ *   BROWSERBASE_PROJECT_ID - Your Browserbase project ID  
+ *   SUPABASE_URL - Supabase project URL
+ *   SUPABASE_SERVICE_ROLE_KEY - Supabase service role key
  */
 
+const puppeteer = require('puppeteer-core');
+
+const BROWSERBASE_API_KEY = process.env.BROWSERBASE_API_KEY;
+const BROWSERBASE_PROJECT_ID = process.env.BROWSERBASE_PROJECT_ID;
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://usknntguurefeyzusbdh.supabase.co';
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const SAVE_ENDPOINT = `${SUPABASE_URL}/functions/v1/save-agents`;
-const DELAY_BETWEEN_PAGES = 3000;
+
+const DELAY_BETWEEN_PAGES = 4000;
 const AGENTS_PER_PAGE = 48;
 const MAX_PAGES = 150;
 
 /**
- * Parse HTML and extract agents
+ * Create a Browserbase session and return connection URL
  */
-function extractAgentsFromHTML(html, city) {
-  const agents = [];
+async function createSession() {
+  const response = await fetch('https://www.browserbase.com/v1/sessions', {
+    method: 'POST',
+    headers: {
+      'x-bb-api-key': BROWSERBASE_API_KEY,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      projectId: BROWSERBASE_PROJECT_ID,
+      browserSettings: {
+        fingerprint: {
+          devices: ['desktop'],
+          locales: ['en-US'],
+          operatingSystems: ['macos']
+        }
+      }
+    })
+  });
   
-  // Find all agent profile links
-  const linkRegex = /href="(\/real-estate-agents\/([a-z0-9-]+)\/([a-z0-9]+)\/)"/g;
-  let match;
-  
-  while ((match = linkRegex.exec(html)) !== null) {
-    const [, href, nameSlug, agentId] = match;
-    
-    // Skip city/state pages
-    if (nameSlug.match(/-[a-z]{2}$/) || agentId.length < 4) continue;
-    
-    // Find the agent card section around this link
-    const linkPos = match.index;
-    const cardStart = Math.max(0, html.lastIndexOf('<article', linkPos));
-    const cardEnd = html.indexOf('</article>', linkPos);
-    
-    if (cardStart === -1 || cardEnd === -1) continue;
-    
-    const cardHtml = html.substring(cardStart, cardEnd + 10);
-    
-    // Extract name from the link text
-    const nameMatch = cardHtml.match(new RegExp(`href="${href}"[^>]*>([^<]+)</a>`));
-    const name = nameMatch ? nameMatch[1].trim() : null;
-    
-    if (!name || name.length < 3 || name.includes('Real Estate')) continue;
-    if (agents.find(a => a.name === name)) continue;
-    
-    // Extract phone
-    const phoneMatch = cardHtml.match(/\((\d{3})\)\s*(\d{3})[-\s]?(\d{4})/);
-    const phone = phoneMatch ? `(${phoneMatch[1]}) ${phoneMatch[2]}-${phoneMatch[3]}` : null;
-    
-    // Extract sales
-    const totalMatch = cardHtml.match(/(\d+)\s*Total Sales/i);
-    const localRegex = new RegExp(`(\\d+)\\s*in\\s*${city}`, 'i');
-    const localMatch = cardHtml.match(localRegex);
-    
-    // Extract price range
-    const priceMatch = cardHtml.match(/\$([\d,.]+[KM]?)\s*(?:-\s*\$([\d,.]+[KM]?))?\s*Price/i);
-    let priceLow = null, priceHigh = null;
-    if (priceMatch) {
-      const parseP = p => {
-        if (!p) return null;
-        const c = p.replace(/[$,]/g, '');
-        if (c.endsWith('M')) return parseFloat(c) * 1000000;
-        if (c.endsWith('K')) return parseFloat(c) * 1000;
-        return parseFloat(c);
-      };
-      priceLow = parseP(priceMatch[1]);
-      priceHigh = priceMatch[2] ? parseP(priceMatch[2]) : priceLow;
-    }
-    
-    // Extract brokerage (line after name)
-    let brokerage = null;
-    const brokerageMatch = cardHtml.match(new RegExp(`>${name}</a>\\s*</[^>]+>\\s*<[^>]+>([^<]+)</`, 'i'));
-    if (brokerageMatch && brokerageMatch[1].length > 5 && brokerageMatch[1].length < 80) {
-      brokerage = brokerageMatch[1].trim();
-    }
-    
-    // Extract photo
-    const imgMatch = cardHtml.match(/imagescdn\.homes\.com\/i2\/([^\/\"]+)\/(\d+)\/([^\.\"]+\.jpg)/);
-    const photoUrl = imgMatch ? `https://imagescdn.homes.com/i2/${imgMatch[1]}/${imgMatch[2]}/${imgMatch[3]}` : null;
-    
-    agents.push({
-      name,
-      brokerage,
-      phone,
-      total_sales: totalMatch ? parseInt(totalMatch[1]) : null,
-      local_sales: localMatch ? parseInt(localMatch[1]) : null,
-      price_range_low: priceLow,
-      price_range_high: priceHigh,
-      photo_url: photoUrl,
-      profile_url: `https://www.homes.com${href}`,
-      homes_com_slug: agentId,
-      responds_quickly: cardHtml.toLowerCase().includes('responds quickly'),
-      has_video: cardHtml.toLowerCase().includes('play video')
-    });
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Failed to create session: ${response.status} - ${error}`);
   }
   
-  return agents;
+  return await response.json();
 }
 
 /**
- * Get total agent count from HTML
+ * Extract agents from page using Puppeteer
  */
-function getTotalAgentsFromHTML(html) {
-  const match = html.match(/([\d,]+)\s*Real Estate Agents serving/i);
-  return match ? parseInt(match[1].replace(/,/g, '')) : null;
+async function extractAgentsFromPage(page, city) {
+  return await page.evaluate((cityName) => {
+    const agents = [];
+    const links = document.querySelectorAll('a[href*="/real-estate-agents/"][href$="/"]');
+    
+    links.forEach(link => {
+      const href = link.getAttribute('href');
+      const match = href.match(/\/real-estate-agents\/([a-z0-9-]+)\/([a-z0-9]+)\/$/);
+      if (!match) return;
+      
+      const [, nameSlug, agentId] = match;
+      if (nameSlug.match(/-[a-z]{2}$/) || agentId.length < 4) return;
+      
+      const name = link.textContent.trim();
+      if (!name || name.length < 3 || name.includes('Real Estate')) return;
+      if (agents.find(a => a.name === name)) return;
+      
+      let card = link.closest('article') || link.parentElement?.parentElement?.parentElement?.parentElement;
+      if (!card) return;
+      
+      const text = card.innerText || '';
+      const html = card.innerHTML || '';
+      
+      const phoneMatch = text.match(/\((\d{3})\)\s*(\d{3})[-\s]?(\d{4})/);
+      const totalMatch = text.match(/(\d+)\s*Total Sales/i);
+      const localRegex = new RegExp(`(\\d+)\\s*in\\s*${cityName}`, 'i');
+      const localMatch = text.match(localRegex);
+      
+      const priceMatch = text.match(/\$([\d,.]+[KM]?)\s*(?:-\s*\$([\d,.]+[KM]?))?\s*Price/i);
+      let priceLow = null, priceHigh = null;
+      if (priceMatch) {
+        const parseP = p => {
+          if (!p) return null;
+          const c = p.replace(/[$,]/g, '');
+          if (c.endsWith('M')) return parseFloat(c) * 1000000;
+          if (c.endsWith('K')) return parseFloat(c) * 1000;
+          return parseFloat(c);
+        };
+        priceLow = parseP(priceMatch[1]);
+        priceHigh = priceMatch[2] ? parseP(priceMatch[2]) : priceLow;
+      }
+      
+      let brokerage = null;
+      const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 3);
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i] === name && lines[i+1] && !lines[i+1].match(/^\(/) && !lines[i+1].match(/^\d+\s*(Total|in\s)/i)) {
+          if (lines[i+1].length > 5 && lines[i+1].length < 80 && lines[i+1] !== 'RESPONDS QUICKLY') {
+            brokerage = lines[i+1];
+            break;
+          }
+        }
+      }
+      
+      const imgMatch = html.match(/imagescdn\.homes\.com\/i2\/([^\/\"]+)\/(\d+)\/([^\.\"]+\.jpg)/);
+      
+      agents.push({
+        name,
+        brokerage,
+        phone: phoneMatch ? `(${phoneMatch[1]}) ${phoneMatch[2]}-${phoneMatch[3]}` : null,
+        total_sales: totalMatch ? parseInt(totalMatch[1]) : null,
+        local_sales: localMatch ? parseInt(localMatch[1]) : null,
+        price_range_low: priceLow,
+        price_range_high: priceHigh,
+        photo_url: imgMatch ? `https://imagescdn.homes.com/i2/${imgMatch[1]}/${imgMatch[2]}/${imgMatch[3]}` : null,
+        profile_url: `https://www.homes.com${href}`,
+        homes_com_slug: agentId,
+        responds_quickly: text.toLowerCase().includes('responds quickly'),
+        has_video: html.toLowerCase().includes('play video')
+      });
+    });
+    
+    return agents;
+  }, city);
+}
+
+/**
+ * Get total agent count
+ */
+async function getTotalAgents(page) {
+  return await page.evaluate(() => {
+    const match = document.body.innerText.match(/([\d,]+)\s*Real Estate Agents serving/i);
+    return match ? parseInt(match[1].replace(/,/g, '')) : null;
+  });
 }
 
 /**
@@ -127,7 +170,6 @@ async function saveAgents(agents, city, state) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ agents: records })
     });
-    
     const data = await response.json();
     return data.saved || 0;
   } catch (err) {
@@ -137,7 +179,7 @@ async function saveAgents(agents, city, state) {
 }
 
 /**
- * Scrape a single market using fetch
+ * Scrape a market using Browserbase
  */
 async function scrapeMarket(city, state) {
   const citySlug = city.toLowerCase().replace(/[^a-z0-9]+/g, '-');
@@ -146,78 +188,89 @@ async function scrapeMarket(city, state) {
   
   console.log(`\n🏠 Scraping ${city}, ${state}...`);
   
+  let browser = null;
   let allAgents = [];
   let savedCount = 0;
   
   try {
-    // Page 1
-    const response1 = await fetch(`${baseUrl}/`, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-      }
+    // Create Browserbase session
+    console.log('🌐 Creating Browserbase session...');
+    const session = await createSession();
+    console.log(`✅ Session ID: ${session.id}`);
+    
+    // Connect Puppeteer to Browserbase
+    const wsUrl = `wss://connect.browserbase.com?apiKey=${BROWSERBASE_API_KEY}&sessionId=${session.id}`;
+    browser = await puppeteer.connect({
+      browserWSEndpoint: wsUrl
     });
     
-    if (!response1.ok) {
-      console.log(`❌ Failed to fetch page 1: ${response1.status}`);
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1920, height: 1080 });
+    
+    // Navigate to first page
+    console.log('📄 Loading page 1...');
+    await page.goto(`${baseUrl}/`, { 
+      waitUntil: 'networkidle2',
+      timeout: 30000 
+    });
+    
+    // Check for block
+    const isBlocked = await page.evaluate(() => 
+      document.body.innerText.includes('Access Denied') ||
+      document.body.innerText.includes('blocked')
+    );
+    
+    if (isBlocked) {
+      console.log('🚫 Blocked on first page!');
       return 0;
     }
     
-    const html1 = await response1.text();
-    const totalAgents = getTotalAgentsFromHTML(html1);
+    const totalAgents = await getTotalAgents(page);
     const totalPages = totalAgents ? Math.min(Math.ceil(totalAgents / AGENTS_PER_PAGE), MAX_PAGES) : MAX_PAGES;
     
-    console.log(`📊 Total agents: ${totalAgents || 'unknown'}, Pages: ${totalPages}`);
+    console.log(`📊 Total: ${totalAgents || '?'} agents, ${totalPages} pages`);
     
-    const page1Agents = extractAgentsFromHTML(html1, city);
+    // Extract page 1
+    const page1Agents = await extractAgentsFromPage(page, city);
     allAgents = allAgents.concat(page1Agents);
     console.log(`📄 Page 1/${totalPages}: ${page1Agents.length} agents`);
     
-    // Remaining pages
+    // Scrape remaining pages
     for (let pageNum = 2; pageNum <= totalPages; pageNum++) {
       await new Promise(r => setTimeout(r, DELAY_BETWEEN_PAGES));
       
       try {
-        const response = await fetch(`${baseUrl}/p${pageNum}/`, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-          }
+        await page.goto(`${baseUrl}/p${pageNum}/`, {
+          waitUntil: 'networkidle2',
+          timeout: 30000
         });
         
-        if (!response.ok) {
-          if (response.status === 403) {
-            console.log(`⚠️ Rate limited at page ${pageNum}. Waiting 30s...`);
-            await new Promise(r => setTimeout(r, 30000));
-            continue;
-          }
-          console.log(`⚠️ Page ${pageNum}: ${response.status}`);
-          continue;
+        const blocked = await page.evaluate(() =>
+          document.body.innerText.includes('Access Denied')
+        );
+        
+        if (blocked) {
+          console.log(`🚫 Blocked at page ${pageNum}`);
+          break;
         }
         
-        const html = await response.text();
-        
-        if (html.includes('Access Denied') || html.includes('blocked')) {
-          console.log(`🚫 Rate limited at page ${pageNum}. Waiting 60s...`);
-          await new Promise(r => setTimeout(r, 60000));
-          continue;
-        }
-        
-        const pageAgents = extractAgentsFromHTML(html, city);
+        const pageAgents = await extractAgentsFromPage(page, city);
         allAgents = allAgents.concat(pageAgents);
         
         if (pageNum % 10 === 0) {
           console.log(`📄 Page ${pageNum}/${totalPages}: ${pageAgents.length} agents (Total: ${allAgents.length})`);
         }
         
-        // Save in batches of 200
+        // Save in batches
         if (allAgents.length >= 200) {
           const saved = await saveAgents(allAgents, city, state);
           savedCount += saved;
-          console.log(`💾 Saved batch: ${saved} agents`);
+          console.log(`💾 Saved: ${saved} agents`);
           allAgents = [];
         }
         
       } catch (err) {
-        console.error(`❌ Page ${pageNum} error:`, err.message);
+        console.error(`❌ Page ${pageNum}: ${err.message}`);
       }
     }
     
@@ -230,14 +283,18 @@ async function scrapeMarket(city, state) {
     console.log(`✅ ${city}, ${state}: ${savedCount} agents saved`);
     
   } catch (err) {
-    console.error(`❌ Market error:`, err.message);
+    console.error(`❌ Error: ${err.message}`);
+  } finally {
+    if (browser) {
+      await browser.close();
+    }
   }
   
   return savedCount;
 }
 
 /**
- * Get target markets from Supabase
+ * Get target markets
  */
 async function getTargetMarkets() {
   try {
@@ -247,11 +304,9 @@ async function getTargetMarkets() {
         'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`
       }
     });
-    
-    const markets = await response.json();
-    return markets.sort((a, b) => a.priority - b.priority);
+    return (await response.json()).sort((a, b) => a.priority - b.priority);
   } catch (err) {
-    console.error('Failed to fetch target markets:', err.message);
+    console.error('Failed to fetch markets:', err.message);
     return [];
   }
 }
@@ -260,33 +315,33 @@ async function getTargetMarkets() {
  * Main
  */
 async function main() {
-  console.log('🚀 RKRT Agent Scraper starting...\n');
+  console.log('🚀 RKRT Agent Scraper (Browserbase) starting...\n');
   
-  let totalSaved = 0;
+  if (!BROWSERBASE_API_KEY) {
+    console.error('❌ BROWSERBASE_API_KEY not set');
+    process.exit(1);
+  }
+  if (!BROWSERBASE_PROJECT_ID) {
+    console.error('❌ BROWSERBASE_PROJECT_ID not set');
+    process.exit(1);
+  }
   
   const args = process.argv.slice(2);
+  let totalSaved = 0;
   
   if (args.length >= 2) {
-    const [city, state] = args;
-    totalSaved = await scrapeMarket(city, state);
+    totalSaved = await scrapeMarket(args[0], args[1]);
   } else {
     const markets = await getTargetMarkets();
+    console.log(`📋 ${markets.length} target markets`);
     
-    if (markets.length === 0) {
-      console.log('No target markets found.');
-      return;
-    }
-    
-    console.log(`📋 Found ${markets.length} target markets`);
-    
-    for (const market of markets) {
-      const saved = await scrapeMarket(market.city, market.state);
-      totalSaved += saved;
-      await new Promise(r => setTimeout(r, 10000));
+    for (const m of markets) {
+      totalSaved += await scrapeMarket(m.city, m.state);
+      await new Promise(r => setTimeout(r, 5000));
     }
   }
   
-  console.log(`\n🎉 Scrape complete! Total agents saved: ${totalSaved}`);
+  console.log(`\n🎉 Done! Total saved: ${totalSaved}`);
 }
 
 main().catch(console.error);
